@@ -65,6 +65,41 @@ class AgentEventEmitter:
             payload["error_code"] = error_code
         await self._persist(task_id, event_type, payload, duration_ms=duration_ms)
 
+    async def report_retry(self, task_id: str, report_retry_count: int) -> None:
+        async with self.sessions() as session:
+            task = await task_service.tasks.get_by_id(session, task_id, lock=True)
+            if task is None:
+                return
+            task.retry_count += 1
+            payload = {
+                "task_status": "running",
+                "current_step": "build_report_ir",
+                "retry_scope": "report_ir_validation",
+                "retry_count": task.retry_count,
+                "report_retry_count": report_retry_count,
+            }
+            session.add(
+                TaskLog(
+                    task_id=task_id,
+                    log_level="info",
+                    log_type="retry",
+                    log_content=(
+                        "Report IR validation retry "
+                        f"{report_retry_count}; task retry count {task.retry_count}"
+                    ),
+                    trace_id=f"task:{task_id}",
+                )
+            )
+            event = await event_service.append(
+                session,
+                task,
+                "task_status",
+                payload,
+                already_locked=True,
+            )
+            await session.commit()
+        await event_service.publish(self.redis, [event])
+
     async def _persist(
         self,
         task_id: str,

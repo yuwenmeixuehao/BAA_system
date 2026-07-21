@@ -26,6 +26,13 @@ class AgentRuntime:
     def wrap_node(self, node_name: str, node: NodeCallable) -> NodeCallable:
         async def wrapped(state: AgentState) -> AgentState:
             await self.check_cancelled()
+            if node_name == "build_report_ir" and int(
+                state.get("report_retry_count", 0)
+            ) > 0:
+                await self.emitter.report_retry(
+                    state["task_id"],
+                    int(state["report_retry_count"]),
+                )
             await self.emitter.node(state["task_id"], node_name, "started")
             started_at = time.perf_counter()
             try:

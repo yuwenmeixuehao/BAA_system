@@ -181,9 +181,10 @@ BASE_URL=<openai-compatible-api-base>
 ## 阶段五完成项
 
 - 回收阶段四延后项：`build_evidence` 生成可引用证据，`determine_attribution` 将结论区分为
-  `confirmed/probable/to_verify`，已证实结论必须关联证据；
+  `confirmed/probable/to_verify`；证据质量关联数据校验结果，`limited` 证据不能单独支撑
+  `confirmed` 结论；
 - `build_report_ir`、`validate_report` 和 `render_report` 形成完整六部分 Report IR，使用
-  Pydantic 校验有限数值、证据引用、图表白名单和数据量，校验失败最多回退重建一次；
+  Pydantic 校验有限数值、证据引用、图表白名单和数据量，校验失败会根据错误安全修复一次；
 - 生成 HTML、Markdown 和 Report IR JSON 三类文件，HTML 使用 ECharts 渲染；提供
   `GET /api/results/{task_id}` 和 `/api/results/{task_id}/export?format=html|md|json`；
 - 市场表现分析补充订单量、客单价、转化率、ROAS 及渠道/地区等维度变化；库存分析补充

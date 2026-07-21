@@ -1,6 +1,7 @@
 from typing import Any
 
 from app.agent.state import AgentState
+from app.services.report_validator import report_validator
 
 METRIC_LABELS = {
     "sales_amount": "销售额",
@@ -14,6 +15,19 @@ METRIC_LABELS = {
 
 class BuildReportIRNode:
     async def __call__(self, state: AgentState) -> AgentState:
+        if (
+            int(state.get("report_retry_count", 0)) > 0
+            and state.get("report_ir")
+            and state.get("report_validation_errors")
+        ):
+            return {
+                "report_ir": report_validator.repair(
+                    state["report_ir"],
+                    state["report_validation_errors"],
+                ),
+                "report_valid": False,
+                "current_step": "build_report_ir",
+            }
         definition = state["problem_definition"]
         results = state.get("metric_results", {})
         scenario = str(results.get("scenario") or "general")

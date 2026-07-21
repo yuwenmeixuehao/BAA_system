@@ -13,6 +13,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.pool import StaticPool
 
 from app.agent.errors import AgentExecutionError
+from app.agent.events import AgentEventEmitter
+from app.agent.nodes.build_evidence import BuildEvidenceNode
+from app.agent.nodes.build_report_ir import BuildReportIRNode
+from app.agent.nodes.determine_attribution import DetermineAttributionNode
 from app.agent.nodes.validate_report import ValidateReportNode
 from app.agent.storage.workspace import WorkspaceStorage
 from app.agent.tools.base import ToolContext
@@ -204,20 +208,106 @@ def test_report_ir_enforces_evidence_references_and_chart_shape() -> None:
     with pytest.raises(ValidationError, match="category and series lengths"):
         ReportIR.model_validate(invalid_chart)
 
+    limited_evidence = deepcopy(valid_report_payload())
+    limited_evidence["evidence_list"][0]["quality_status"] = "limited"
+    with pytest.raises(ValidationError, match="requires verified evidence"):
+        ReportIR.model_validate(limited_evidence)
+
 
 @pytest.mark.asyncio
-async def test_report_validation_retries_once_then_fails_safely() -> None:
+async def test_report_validation_repairs_safe_errors_and_fails_once_if_unrepairable() -> None:
     invalid = valid_report_payload()
     invalid["attribution_conclusions"][0]["evidence_ids"] = []
-    node = ValidateReportNode()
+    validator = ValidateReportNode()
+    builder = BuildReportIRNode()
 
-    first = await node({"report_ir": invalid, "report_retry_count": 0})  # type: ignore[arg-type]
+    first = await validator(  # type: ignore[arg-type]
+        {"report_ir": invalid, "report_retry_count": 0}
+    )
     assert first["report_valid"] is False
     assert first["report_retry_count"] == 1
+    repaired = await builder(  # type: ignore[arg-type]
+        {
+            "report_ir": invalid,
+            "report_retry_count": first["report_retry_count"],
+            "report_validation_errors": first["report_validation_errors"],
+        }
+    )
+    validated = await validator(  # type: ignore[arg-type]
+        {
+            "report_ir": repaired["report_ir"],
+            "report_retry_count": 1,
+        }
+    )
+    assert validated["report_valid"] is True
+    assert validated["report_ir"]["attribution_conclusions"][0]["status"] == "to_verify"
 
+    unrepairable = valid_report_payload()
+    unrepairable["key_metrics"] = []
+    first_failure = await validator(  # type: ignore[arg-type]
+        {"report_ir": unrepairable, "report_retry_count": 0}
+    )
+    repaired_failure = await builder(  # type: ignore[arg-type]
+        {
+            "report_ir": unrepairable,
+            "report_retry_count": 1,
+            "report_validation_errors": first_failure["report_validation_errors"],
+        }
+    )
     with pytest.raises(AgentExecutionError) as error:
-        await node({"report_ir": invalid, "report_retry_count": 1})  # type: ignore[arg-type]
+        await validator(  # type: ignore[arg-type]
+            {"report_ir": repaired_failure["report_ir"], "report_retry_count": 1}
+        )
     assert error.value.error_code == "REPORT_INVALID"
+
+
+@pytest.mark.asyncio
+async def test_limited_data_quality_produces_probable_attribution() -> None:
+    state: dict[str, Any] = {
+        "problem_definition": {"time_range": "2026年7月"},
+        "metric_results": {
+            "comparisons": [
+                {
+                    "file_id": "file-001",
+                    "metric_field": "销售额",
+                    "current_period": "2026-07",
+                    "current_value": 800,
+                    "baseline_period": "2026-06",
+                    "baseline_value": 1000,
+                    "absolute_change": -200,
+                    "change_rate": -0.2,
+                    "formula": "current - baseline",
+                }
+            ]
+        },
+        "data_quality": {
+            "usable": True,
+            "files": [
+                {
+                    "file_id": "file-001",
+                    "usable": True,
+                    "metric_field": "销售额",
+                    "time_field": "日期",
+                    "time_min": "2026-06-01T00:00:00",
+                    "time_max": "2026-07-31T00:00:00",
+                    "missing_counts": {"销售额": 1},
+                    "duplicate_count": 0,
+                    "sample_size_warning": False,
+                }
+            ],
+            "gaps": [],
+        },
+    }
+    evidence_update = await BuildEvidenceNode()(state)  # type: ignore[arg-type]
+    conclusion_update = await DetermineAttributionNode()(
+        {**state, **evidence_update}  # type: ignore[arg-type]
+    )
+
+    assert evidence_update["evidence_list"][0]["quality_status"] == "limited"
+    conclusion = conclusion_update["attribution_candidates"][0]
+    assert conclusion["status"] == "probable"
+    assert conclusion["verification_needed"] is True
+    assert conclusion["confidence"] <= 0.7
 
 
 def test_report_renderer_outputs_six_sections_and_three_files(tmp_path: Path) -> None:
@@ -314,6 +404,101 @@ async def test_context_compression_retains_recent_messages(
     assert summary is not None
     assert (summary.start_seq_no, summary.end_seq_no) == (1, 3)
     assert "第1条经营分析上下文" in summary.summary_text
+
+
+@pytest.mark.asyncio
+async def test_context_compression_budget_keeps_every_covered_message(
+    stage_five_database: StageFiveDatabase,
+) -> None:
+    async with stage_five_database.sessions() as session:
+        session.add_all(
+            [
+                Message(
+                    conversation_id=stage_five_database.conversation.id,
+                    seq_no=index,
+                    role="user" if index % 2 else "assistant",
+                    message_type="text",
+                    content=(
+                        f"消息{index}开头-"
+                        + ("经营分析上下文" * 250)
+                        + f"-消息{index}结尾"
+                    ),
+                )
+                for index in range(1, 23)
+            ]
+        )
+        await session.commit()
+    service = ContextSummaryService(
+        stage_five_database.sessions,
+        Settings(
+            _env_file=None,
+            CONTEXT_SUMMARY_MESSAGE_THRESHOLD=5,
+            CONTEXT_SUMMARY_CHAR_THRESHOLD=1000,
+            CONTEXT_SUMMARY_RETAIN_MESSAGES=2,
+        ),
+    )
+
+    summary = await service.compress_if_needed(stage_five_database.conversation.id)
+
+    assert summary is not None and summary.end_seq_no == 20
+    assert len(summary.summary_text) <= 12_000
+    for index in range(1, 21):
+        assert f"[{index}]：" in summary.summary_text
+        assert f"消息{index}开头" in summary.summary_text
+        assert f"消息{index}结尾" in summary.summary_text
+
+
+@pytest.mark.asyncio
+async def test_report_retry_updates_task_event_and_log(
+    stage_five_database: StageFiveDatabase,
+) -> None:
+    async with stage_five_database.sessions() as session:
+        message = Message(
+            conversation_id=stage_five_database.conversation.id,
+            seq_no=1,
+            role="user",
+            message_type="text",
+            content="生成归因报告",
+        )
+        session.add(message)
+        await session.flush()
+        task = AnalysisTask(
+            user_id=stage_five_database.user.id,
+            conversation_id=stage_five_database.conversation.id,
+            message_id=message.id,
+            client_msg_id="report-retry-phase-five",
+            task_status="running",
+            current_step="validate_report",
+            thread_id="thread-report-retry",
+            input_text="生成归因报告",
+            retry_count=0,
+        )
+        session.add(task)
+        await session.commit()
+        task_id = task.id
+
+    redis = FakeRedis()
+    emitter = AgentEventEmitter(
+        redis,  # type: ignore[arg-type]
+        stage_five_database.sessions,
+    )
+    await emitter.report_retry(task_id, 1)
+
+    async with stage_five_database.sessions() as session:
+        task = await session.get(AnalysisTask, task_id)
+        event = await session.scalar(
+            select(TaskEvent).where(TaskEvent.task_id == task_id)
+        )
+        log = await session.scalar(
+            select(TaskLog).where(
+                TaskLog.task_id == task_id,
+                TaskLog.log_type == "retry",
+            )
+        )
+
+    assert task is not None and task.retry_count == 1
+    assert event is not None and event.payload_json["report_retry_count"] == 1
+    assert log is not None and "Report IR validation retry" in log.log_content
 
 
 @pytest.mark.asyncio
