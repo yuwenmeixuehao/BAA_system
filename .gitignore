@@ -1,0 +1,38 @@
+# Environment and secrets
+.env
+backend/.env
+frontend/.env.local
+
+# Python
+backend/.venv/
+backend/.pytest_cache/
+backend/.ruff_cache/
+backend/**/__pycache__/
+backend/**/*.py[cod]
+*.egg-info/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/*.tsbuildinfo
+
+# IDE and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Runtime data
+data/
+logs/
+
+# Reports
+代码审查报告_阶段一二.md
+代码审查报告_阶段三.md
+代码审查报告_阶段四_LLM使用分析.md
+代码审查报告_阶段五.md
+归因分析.md
+经营归因分析系统_概要设计初稿.md
+经营归因分析系统_详细设计初稿.md
+经营归因分析系统_详细设计评审报告.md
