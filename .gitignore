@@ -26,6 +26,7 @@ Thumbs.db
 # Runtime data
 data/
 logs/
+sql/
 
 init_business_data.sql
 init_insight_agent.sql
