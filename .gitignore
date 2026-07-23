@@ -28,6 +28,7 @@ data/
 logs/
 
 init_business_data.sql
+init_insight_agent.sql
 
 # Reports
 代码审查报告_阶段一二.md
