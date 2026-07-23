@@ -12,7 +12,13 @@ from app.core.config import Settings
 
 
 class DataAgentClient(Protocol):
-    async def query(self, objective: str, context: ToolContext) -> dict[str, Any]: ...
+    async def query(
+        self,
+        objective: str,
+        context: ToolContext,
+        *,
+        user_question: str | None = None,
+    ) -> dict[str, Any]: ...
 
 
 class HttpDataAgentClient:
@@ -22,9 +28,20 @@ class HttpDataAgentClient:
         self.api_key = settings.data_agent_api_key
         self.timeout = settings.data_agent_timeout_seconds
 
-    async def query(self, objective: str, context: ToolContext) -> dict[str, Any]:
-        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+    async def query(
+        self,
+        objective: str,
+        context: ToolContext,
+        *,
+        user_question: str | None = None,
+    ) -> dict[str, Any]:
+        headers = {self.settings.trace_id_header: context.trace_id}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        async with httpx.AsyncClient(
+            timeout=self.timeout,
+            trust_env=False,
+        ) as client:
             response: httpx.Response | None = None
             for attempt in range(3):
                 try:
@@ -33,6 +50,7 @@ class HttpDataAgentClient:
                         headers=headers,
                         json={
                             "objective": objective,
+                            "user_question": user_question,
                             "user_id": context.user_id,
                             "conversation_id": context.conversation_id,
                             "task_id": context.task_id,
@@ -48,10 +66,13 @@ class HttpDataAgentClient:
                     break
                 except httpx.HTTPStatusError as exc:
                     if exc.response.status_code < 500 or attempt >= 2:
-                        raise
-                except httpx.RequestError:
+                        raise ValueError(_data_agent_error_message(exc.response)) from exc
+                except httpx.RequestError as exc:
                     if attempt >= 2:
-                        raise
+                        raise ValueError(
+                            "DATA_AGENT_UNAVAILABLE: "
+                            f"无法连接本地 Data Agent（{self.base_url}）"
+                        ) from exc
                 await asyncio.sleep(0.25 * (2**attempt))
             if response is None:
                 raise httpx.RequestError("Data Agent request did not start")
@@ -59,6 +80,20 @@ class HttpDataAgentClient:
         if not isinstance(payload, dict):
             raise ValueError("invalid Data Agent response")
         return payload
+
+
+def _data_agent_error_message(response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            code = str(error.get("code") or "DATA_AGENT_ERROR")
+            message = str(error.get("message") or "Data Agent request failed")
+            return f"{code}: {message}"
+    return f"Data Agent HTTP {response.status_code}"
 
 
 class DbQueryTool:
@@ -72,7 +107,13 @@ class DbQueryTool:
             HttpDataAgentClient(settings) if settings.data_agent_base_url else None
         )
 
-    async def run(self, objective: str, context: ToolContext) -> ToolResult:
+    async def run(
+        self,
+        objective: str,
+        context: ToolContext,
+        *,
+        user_question: str | None = None,
+    ) -> ToolResult:
         if self.client is None:
             return ToolResult(
                 ok=False,
@@ -80,7 +121,11 @@ class DbQueryTool:
                 error_code="DATA_AGENT_NOT_CONFIGURED",
             )
         try:
-            response = await self.client.query(objective, context)
+            response = await self.client.query(
+                objective,
+                context,
+                user_question=user_question,
+            )
             sql = str(response.get("sql") or "")
             validate_read_only_sql(
                 sql,
@@ -97,7 +142,14 @@ class DbQueryTool:
                 raise ValueError("Data Agent rows must be a list of objects")
             if len(rows) > self.settings.agent_max_rows:
                 raise ValueError("Data Agent row limit exceeded")
-            frame = pd.DataFrame(rows)
+            columns = response.get("columns")
+            if not isinstance(columns, list) or any(
+                not isinstance(column, str) for column in columns
+            ):
+                raise ValueError("Data Agent columns must be a list of strings")
+            if not rows:
+                raise ValueError("Data Agent 查询未返回任何数据")
+            frame = pd.DataFrame(rows, columns=columns)
             storage_key = f"tasks/{context.task_id}/raw/data_agent_query.csv"
             storage = WorkspaceStorage(context.workspace_root)
             path = storage.resolve_key(storage_key)
@@ -155,9 +207,16 @@ def validate_read_only_sql(sql: str, *, allowed_tables: set[str] | None = None) 
         if expression_type is not None and statement.find(expression_type):
             raise ValueError("write or administrative SQL is forbidden")
     forbidden_catalogs = {"information_schema", "mysql", "performance_schema", "sys"}
+    cte_names = {
+        cte.alias_or_name.lower()
+        for cte in statement.find_all(exp.CTE)
+        if cte.alias_or_name
+    }
     for table in statement.find_all(exp.Table):
         catalog = (table.catalog or "").lower()
         database = (table.db or "").lower()
+        if not catalog and not database and table.name.lower() in cte_names:
+            continue
         if catalog in forbidden_catalogs or database in forbidden_catalogs:
             raise ValueError("system schemas are forbidden")
         table_name = table.name.lower()

@@ -1,3 +1,5 @@
+import json
+
 from app.agent.errors import AgentExecutionError
 from app.agent.runtime import AgentRuntime
 from app.agent.state import AgentState
@@ -45,12 +47,16 @@ class QueryDataNode:
                     }
                 )
         else:
-            objective = state["question"]
+            objective = build_data_agent_objective(state)
             result = await self.runtime.run_tool(
                 state,
                 "query_data",
                 "db_query",
-                lambda context: self.db_query.run(objective, context),
+                lambda context: self.db_query.run(
+                    objective,
+                    context,
+                    user_question=str(state.get("question") or "").strip() or None,
+                ),
             )
             if not result.ok:
                 raise AgentExecutionError(
@@ -73,3 +79,37 @@ class QueryDataNode:
             "data_files": data_files,
             "current_step": "query_data",
         }
+
+
+def build_data_agent_objective(state: AgentState) -> str:
+    """Keep the planner's structured intent when querying the Data Agent."""
+    question = str(state.get("question") or "").strip()
+    query_specs = state.get("query_specs") or []
+    query_spec = next(
+        (
+            item
+            for item in query_specs
+            if isinstance(item, dict)
+            and item.get("source_preference") in (None, "auto", "data_agent")
+        ),
+        None,
+    )
+    problem_definition = state.get("problem_definition") or {}
+    if not query_spec and not problem_definition:
+        return question
+
+    payload = {
+        "user_question": question,
+        "query_spec": query_spec or {},
+        "problem_definition": {
+            key: problem_definition.get(key)
+            for key in ("metric", "subject", "time_range", "baseline", "dimensions")
+            if key in problem_definition
+        },
+    }
+    return (
+        "Use this structured business query request. The user_question is authoritative; "
+        "the query_spec and problem_definition make its metric, dimensions, time range, "
+        "and comparison baseline explicit. Do not replace it with a generic query.\n"
+        + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    )

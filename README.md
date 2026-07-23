@@ -77,6 +77,29 @@ Set-Location backend
 uv run python -m app.workers.main
 ```
 
+无附件且需要查询业务数据库时，还需在第三个终端启动独立 Data Agent。推荐先启动
+Data Agent，再启动 API 和 Worker：
+
+```powershell
+Set-Location backend
+uv run uvicorn app.data_agent.main:app --host 127.0.0.1 --port 8002
+```
+
+Data Agent 只暴露受 Bearer 密钥保护的 `POST /query`，使用独立只读业务库连接，
+并在执行前完成表白名单、单条只读 SQL、系统库、危险函数、扫描行数、返回行数和超时校验。
+
+如果不使用 `uv`，也可以直接使用项目虚拟环境启动：
+
+```powershell
+Set-Location backend
+.venv\Scripts\python.exe -m uvicorn app.data_agent.main:app --host 127.0.0.1 --port 8002
+.venv\Scripts\python.exe -m app.workers.main
+```
+
+本地联调时请保持 Data Agent、API 和 Worker 的 `DATABASE_URL`、`REDIS_URL`、
+`DATA_AGENT_API_KEY` 与 `AGENT_DATA_ROOT` 配置一致。修改 Data Agent 或 Worker 源码后，
+需要停止并重新启动对应进程；正在运行的 Worker 不会自动加载 Python 源码变更。
+
 Worker 使用 LangGraph 执行“问题定义—查数—校验—分析—证据—归因—报告”节点链，
 通过数据库事件和 Redis Pub/Sub 把节点、工具及结果状态推送到前端。API 与 Worker 必须
 使用同一组 MySQL、Redis 和 `AGENT_DATA_ROOT`。
@@ -177,6 +200,26 @@ BASE_URL=<openai-compatible-api-base>
 无附件时，Agent 会调用受控 Data Agent；其服务地址由 `DATA_AGENT_BASE_URL` 指定，
 接口为 `POST {DATA_AGENT_BASE_URL}/query`。未配置 Data Agent 且任务没有附件时，任务会以
 `DATA_AGENT_NOT_CONFIGURED` 明确失败，不会自动连接业务数据库或生成虚假数据。
+
+本项目内置了可独立启动的 Data Agent 服务，最小配置如下：
+
+```dotenv
+DATA_AGENT_BASE_URL=http://127.0.0.1:8002
+DATA_AGENT_API_KEY=<worker-and-data-agent-shared-secret>
+DATA_AGENT_DATABASE_URL=mysql+aiomysql://readonly:<password>@127.0.0.1:3306/<business-db>?charset=utf8mb4
+DATA_AGENT_ALLOWED_TABLES=biz_channels,biz_ad_campaigns,biz_sales_summary,biz_orders,biz_warehouses,biz_products,biz_skus,biz_inventory,biz_stock_in,biz_stock_out,biz_sales
+```
+
+`DATA_AGENT_API_KEY` 是 Worker 与 Data Agent 之间的服务鉴权密钥，不是模型供应商密钥。
+Data Agent 默认继承分析模型配置；需要单独模型时，配置 `DATA_AGENT_MODEL_PROVIDER`、
+`DATA_AGENT_MODEL_NAME`、`DATA_AGENT_MODEL_API_KEY`、`DATA_AGENT_MODEL_BASE_URL` 和
+`DATA_AGENT_MODEL_TIMEOUT_SECONDS`。生产环境必须给 `DATA_AGENT_DATABASE_URL` 使用数据库层面
+只读账号；应用元数据连接 `DATABASE_URL` 不会被自动复用。
+
+销售渠道对比请求会优先使用原始用户问题中的时间口径；例如“6月”未指定年份时按当前
+业务年份处理，不使用模型计划中可能错误生成的年份。Data Agent 返回的销售聚合字段
+（如 `current_sales_amount`、`cur_amount`、`total_amount`）会统一映射为
+`sales_amount` 指标。
 
 ## 阶段五完成项
 

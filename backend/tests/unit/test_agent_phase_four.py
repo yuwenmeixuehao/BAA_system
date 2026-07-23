@@ -1,9 +1,11 @@
+import json
 from collections import defaultdict
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 
+import httpx
 import pandas as pd
 import pytest
 from fastapi import UploadFile
@@ -14,9 +16,15 @@ from starlette.datastructures import Headers
 
 from app.agent.executor import LangGraphTaskExecutor
 from app.agent.model import AnalysisModelServices, RuleBasedProblemDefinitionExtractor
+from app.agent.nodes.query_data import build_data_agent_objective
 from app.agent.state import AnalysisPlanOutput
 from app.agent.tools.base import ToolContext
-from app.agent.tools.db_query import DbQueryTool, validate_read_only_sql
+from app.agent.tools.db_query import (
+    DbQueryTool,
+    HttpDataAgentClient,
+    _data_agent_error_message,
+    validate_read_only_sql,
+)
 from app.agent.tools.pandas_analyze import PandasAnalyzeTool
 from app.core.config import Settings
 from app.models.base import Base
@@ -79,6 +87,24 @@ class FakeRedis:
         except ValueError:
             return 0
         return 1
+
+
+class EmptyDataAgentClient:
+    async def query(
+        self,
+        objective: str,
+        context: ToolContext,
+        *,
+        user_question: str | None = None,
+    ) -> dict[str, object]:
+        del objective, context, user_question
+        return {
+            "sql": "SELECT total_amount FROM biz_sales WHERE 1 = 0",
+            "rows": [],
+            "columns": ["total_amount"],
+            "scanned_rows": 0,
+            "truncated": False,
+        }
 
 
 class FakeClarificationGenerator:
@@ -212,6 +238,10 @@ def test_analysis_model_config_uses_shared_defaults_and_dedicated_overrides() ->
 
 def test_db_query_sql_guard_accepts_select_and_rejects_unsafe_sql() -> None:
     validate_read_only_sql("WITH recent AS (SELECT * FROM sales) SELECT * FROM recent")
+    validate_read_only_sql(
+        "WITH recent AS (SELECT * FROM sales) SELECT * FROM recent",
+        allowed_tables={"sales"},
+    )
 
     for sql in (
         "UPDATE sales SET amount = 0",
@@ -223,6 +253,112 @@ def test_db_query_sql_guard_accepts_select_and_rejects_unsafe_sql() -> None:
             validate_read_only_sql(sql)
     with pytest.raises(ValueError):
         validate_read_only_sql("SELECT * FROM secret_table", allowed_tables={"sales"})
+
+
+def test_data_agent_error_message_uses_remote_classified_error() -> None:
+    response = httpx.Response(
+        422,
+        json={
+            "error": {
+                "code": "DATA_AGENT_SQL_REJECTED",
+                "message": "候选 SQL 未通过只读安全校验",
+            }
+        },
+    )
+
+    assert _data_agent_error_message(response) == (
+        "DATA_AGENT_SQL_REJECTED: 候选 SQL 未通过只读安全校验"
+    )
+
+
+@pytest.mark.asyncio
+async def test_data_agent_client_does_not_use_environment_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+        async def __aenter__(self) -> "FakeAsyncClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        async def post(self, url: str, **kwargs: object) -> httpx.Response:
+            captured["request_json"] = kwargs.get("json")
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", url),
+                json={
+                    "sql": "SELECT total_amount FROM biz_sales",
+                    "rows": [{"total_amount": 1}],
+                    "columns": ["total_amount"],
+                    "scanned_rows": 1,
+                    "truncated": False,
+                },
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+    client = HttpDataAgentClient(
+        Settings(
+            _env_file=None,
+            DATA_AGENT_BASE_URL="http://127.0.0.1:8002",
+            DATA_AGENT_API_KEY="service-secret",
+        )
+    )
+
+    payload = await client.query(
+        "sales",
+        ToolContext(
+            user_id="user-1",
+            conversation_id="conversation-1",
+            task_id="task-1",
+            workspace_root=tmp_path,
+            trace_id="trace-1",
+        ),
+        user_question="分析 6 月销售额",
+    )
+
+    assert captured["trust_env"] is False
+    assert captured["request_json"]["user_question"] == "分析 6 月销售额"
+    assert payload["rows"] == [{"total_amount": 1}]
+
+
+def test_data_agent_objective_preserves_structured_query_intent() -> None:
+    objective = build_data_agent_objective(
+        {
+            "question": "分析 6 月各渠道销售表现，对比上月",
+            "problem_definition": {
+                "metric": "sales_amount",
+                "time_range": "2026-06",
+                "baseline": "previous_month",
+                "dimensions": ["channel"],
+            },
+            "query_specs": [
+                {
+                    "objective": "按渠道返回销售额和对比期间",
+                    "source_preference": "data_agent",
+                    "required_fields": ["total_amount", "sale_date", "channel_id"],
+                    "dimensions": ["channel"],
+                    "time_range": "2026-06",
+                    "baseline": "previous_month",
+                }
+            ],
+        }
+    )
+
+    payload = json.loads(objective.split("\n", 1)[1])
+    assert payload["query_spec"]["required_fields"] == [
+        "total_amount",
+        "sale_date",
+        "channel_id",
+    ]
+    assert payload["problem_definition"]["dimensions"] == ["channel"]
+    assert payload["user_question"] == "分析 6 月各渠道销售表现，对比上月"
 
 
 @pytest.mark.asyncio
@@ -284,6 +420,46 @@ async def test_unconfigured_db_query_returns_classified_gap(tmp_path: Path) -> N
 
     assert result.ok is False
     assert result.error_code == "DATA_AGENT_NOT_CONFIGURED"
+
+
+@pytest.mark.asyncio
+async def test_empty_db_query_returns_classified_gap(tmp_path: Path) -> None:
+    settings = Settings(
+        AGENT_DATA_ROOT=str(tmp_path),
+        DATA_AGENT_BASE_URL="http://data-agent",
+    )
+    result = await DbQueryTool(settings, EmptyDataAgentClient()).run(
+        "分析本月销售额",
+        ToolContext(
+            user_id="user-1",
+            conversation_id="conversation-1",
+            task_id="task-1",
+            workspace_root=tmp_path,
+            trace_id="trace-1",
+        ),
+    )
+
+    assert result.ok is False
+    assert result.error_code == "DATA_QUERY_FAILED"
+    assert "未返回任何数据" in result.summary
+
+
+def test_sales_metric_alias_matches_aggregated_amount_column() -> None:
+    frame = pd.DataFrame({"channel_id": [1, 2], "cur_amount": [100.0, 200.0]})
+
+    from app.agent.tools.pandas_analyze import find_metric_column
+
+    assert find_metric_column(frame, "sales") == "cur_amount"
+
+
+def test_sales_metric_alias_matches_current_sales_amount_column() -> None:
+    frame = pd.DataFrame(
+        {"channel_id": [1, 2], "current_sales_amount": [100.0, 200.0]}
+    )
+
+    from app.agent.tools.pandas_analyze import find_metric_column
+
+    assert find_metric_column(frame, "sales_amount") == "current_sales_amount"
 
 
 @pytest.mark.asyncio

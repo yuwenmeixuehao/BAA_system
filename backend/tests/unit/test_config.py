@@ -48,3 +48,18 @@ def test_worker_redis_timeout_exceeds_blocking_queue_wait() -> None:
     )
 
     assert settings.effective_worker_redis_socket_timeout_seconds == 25
+
+
+def test_data_agent_model_config_inherits_analysis_profile() -> None:
+    settings = Settings(
+        _env_file=None,
+        MODEL_PROVIDER="openai_compatible",
+        MODEL_NAME="shared-model",
+        API_KEY="shared-key",
+        BASE_URL="https://llm.example/v1",
+    )
+
+    assert settings.data_query_model_provider == "openai_compatible"
+    assert settings.data_query_model_name == "shared-model"
+    assert settings.data_query_model_api_key == "shared-key"
+    assert settings.data_query_model_base_url == "https://llm.example/v1"

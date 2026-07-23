@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from app.agent.model import DIMENSION_ALIASES, METRIC_ALIASES
+from app.agent.model import DIMENSION_ALIASES, METRIC_ALIASES, canonical_metric
 from app.agent.storage.workspace import WorkspaceStorage
 from app.agent.tools.base import ToolContext, ToolResult
 from app.agent.tools.tabular import json_safe, read_dataframe
@@ -203,7 +203,8 @@ def find_metric_column(frame: pd.DataFrame, metric: str) -> str | None:
         if pd.api.types.is_numeric_dtype(frame[column])
         or pd.to_numeric(frame[column], errors="coerce").notna().any()
     ]
-    aliases = (metric, *METRIC_ALIASES.get(metric, ()))
+    canonical = canonical_metric(metric) or metric
+    aliases = (metric, canonical, *METRIC_ALIASES.get(canonical, ()))
     normalized = {
         column.lower().replace(" ", "").replace("_", ""): column
         for column in numeric_columns

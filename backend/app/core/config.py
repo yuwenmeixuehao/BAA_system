@@ -161,6 +161,7 @@ class Settings(BaseSettings):
     )
     data_agent_base_url: str = Field(default="", alias="DATA_AGENT_BASE_URL")
     data_agent_api_key: str = Field(default="", alias="DATA_AGENT_API_KEY")
+    data_agent_database_url: str = Field(default="", alias="DATA_AGENT_DATABASE_URL")
     data_agent_timeout_seconds: float = Field(
         default=30.0,
         gt=0,
@@ -172,6 +173,18 @@ class Settings(BaseSettings):
         alias="DATA_AGENT_MAX_SCANNED_ROWS",
     )
     data_agent_allowed_tables: str = Field(default="", alias="DATA_AGENT_ALLOWED_TABLES")
+    data_agent_model_provider: str = Field(
+        default="",
+        alias="DATA_AGENT_MODEL_PROVIDER",
+    )
+    data_agent_model_name: str = Field(default="", alias="DATA_AGENT_MODEL_NAME")
+    data_agent_model_api_key: str = Field(default="", alias="DATA_AGENT_MODEL_API_KEY")
+    data_agent_model_base_url: str = Field(default="", alias="DATA_AGENT_MODEL_BASE_URL")
+    data_agent_model_timeout_seconds: float | None = Field(
+        default=None,
+        gt=0,
+        alias="DATA_AGENT_MODEL_TIMEOUT_SECONDS",
+    )
     agent_data_root: Path = Field(default=PROJECT_ROOT / "data", alias="AGENT_DATA_ROOT")
     agent_context_message_limit: int = Field(
         default=20,
@@ -252,6 +265,26 @@ class Settings(BaseSettings):
             or self.agent_model_timeout_seconds
             or self.model_timeout_seconds
         )
+
+    @property
+    def data_query_model_provider(self) -> str:
+        return self.data_agent_model_provider or self.analysis_model_provider
+
+    @property
+    def data_query_model_name(self) -> str:
+        return self.data_agent_model_name or self.analysis_model_name
+
+    @property
+    def data_query_model_api_key(self) -> str:
+        return self.data_agent_model_api_key or self.analysis_model_api_key
+
+    @property
+    def data_query_model_base_url(self) -> str:
+        return self.data_agent_model_base_url or self.analysis_model_base_url
+
+    @property
+    def data_query_model_timeout_seconds(self) -> float:
+        return self.data_agent_model_timeout_seconds or self.analysis_model_timeout_seconds
 
     @property
     def effective_worker_redis_socket_timeout_seconds(self) -> float:

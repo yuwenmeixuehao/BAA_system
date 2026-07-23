@@ -1,3 +1,4 @@
+import logging
 import re
 from dataclasses import dataclass
 from typing import Protocol
@@ -12,6 +13,15 @@ from app.agent.state import (
     ProblemDefinition,
 )
 from app.core.config import Settings
+
+logger = logging.getLogger(__name__)
+
+
+def _with_structured_output(model: ChatOpenAI, schema: type):
+    """Use function_calling for providers that do not expose OpenAI JSON Schema mode
+    (e.g. DeepSeek). json_mode is unreliable because some providers require the word
+    'json' in the prompt, and json_schema is OpenAI-only."""
+    return model.with_structured_output(schema, method="function_calling")
 
 
 class ProblemDefinitionExtractor(Protocol):
@@ -48,7 +58,21 @@ class AnalysisModelServices:
 
 
 METRIC_ALIASES: dict[str, tuple[str, ...]] = {
-    "sales_amount": ("销售额", "销售收入", "营收", "成交额", "revenue", "sales"),
+    "sales_amount": (
+        "销售额",
+        "销售收入",
+        "营收",
+        "成交额",
+        "revenue",
+        "sales",
+        "amount",
+        "cur_amount",
+        "current_amount",
+        "current_sales_amount",
+        "total_amount",
+        "previous_sales_amount",
+        "prev_amount",
+    ),
     "profit": ("利润", "毛利", "净利润", "profit"),
     "order_count": ("订单量", "订单数", "单量", "order count", "order_count", "orders"),
     "conversion_rate": ("转化率", "成交率", "conversion rate", "conversion_rate"),
@@ -64,6 +88,18 @@ METRIC_ALIASES: dict[str, tuple[str, ...]] = {
     ),
     "customer_count": ("客户数", "用户数", "customer count"),
 }
+
+
+def canonical_metric(metric: str | None) -> str | None:
+    """Map a model/user metric alias to the canonical report metric name."""
+    if not metric:
+        return metric
+    candidate = metric.strip().lower().replace(" ", "").replace("_", "")
+    for canonical, aliases in METRIC_ALIASES.items():
+        names = (canonical, *aliases)
+        if any(candidate == name.lower().replace(" ", "").replace("_", "") for name in names):
+            return canonical
+    return metric
 
 DIMENSION_ALIASES: dict[str, tuple[str, ...]] = {
     "region": ("地区", "区域", "省份", "城市", "region"),
@@ -160,7 +196,7 @@ class RuleBasedProblemDefinitionExtractor:
 
 class LangChainProblemDefinitionExtractor:
     def __init__(self, model: ChatOpenAI) -> None:
-        self.structured_model = model.with_structured_output(ProblemDefinition)
+        self.structured_model = _with_structured_output(model, ProblemDefinition)
 
     async def extract(
         self,
@@ -176,6 +212,7 @@ class LangChainProblemDefinitionExtractor:
                 [
                     SystemMessage(
                         content=(
+                            "Return only a valid JSON object matching the requested schema. "
                             "你是经营分析问题定义器。只提取用户明确表达的信息，不得补造。"
                             "metric 使用稳定英文名称；缺失 metric、time_range 或 "
                             "baseline 时保留 null。"
@@ -188,6 +225,7 @@ class LangChainProblemDefinitionExtractor:
                 ]
             )
         except Exception as exc:
+            logger.exception("problem definition model invocation failed")
             raise AgentExecutionError(
                 "MODEL_INVOCATION_FAILED",
                 "问题定义模型调用失败，请检查模型配置后重试",
@@ -201,7 +239,7 @@ class LangChainProblemDefinitionExtractor:
 
 class LangChainClarificationGenerator:
     def __init__(self, model: ChatOpenAI) -> None:
-        self.structured_model = model.with_structured_output(ClarificationOutput)
+        self.structured_model = _with_structured_output(model, ClarificationOutput)
 
     async def generate(
         self,
@@ -218,6 +256,7 @@ class LangChainClarificationGenerator:
                 [
                     SystemMessage(
                         content=(
+                            "Return only a valid JSON object matching the requested schema. "
                             "你是经营分析澄清助手。根据问题定义中的 missing_fields，"
                             "生成一个简洁、自然、与用户原问题相关的中文追问。"
                             "只询问完成分析必需的信息，不重复询问已有信息，不给出分析结论。"
@@ -233,6 +272,7 @@ class LangChainClarificationGenerator:
                 ]
             )
         except Exception as exc:
+            logger.exception("clarification model invocation failed")
             raise AgentExecutionError(
                 "CLARIFICATION_MODEL_FAILED",
                 "生成澄清问题失败，请稍后重试",
@@ -247,7 +287,7 @@ class LangChainClarificationGenerator:
 
 class LangChainAnalysisPlanner:
     def __init__(self, model: ChatOpenAI) -> None:
-        self.structured_model = model.with_structured_output(AnalysisPlanOutput)
+        self.structured_model = _with_structured_output(model, AnalysisPlanOutput)
 
     async def build(
         self,
@@ -261,6 +301,7 @@ class LangChainAnalysisPlanner:
                 [
                     SystemMessage(
                         content=(
+                            "Return only a valid JSON object matching the requested schema. "
                             "你是经营分析计划器。输出可执行的阶段四计划和查询规格。"
                             "计划只能使用 query_data、validate_data、analyze_with_pandas 三类步骤，"
                             "但每一步的目标、维度和方法必须针对当前问题动态生成。"
@@ -278,6 +319,7 @@ class LangChainAnalysisPlanner:
                 ]
             )
         except Exception as exc:
+            logger.exception("analysis plan model invocation failed")
             raise AgentExecutionError(
                 "ANALYSIS_PLAN_MODEL_FAILED",
                 "生成分析计划失败，请稍后重试",
